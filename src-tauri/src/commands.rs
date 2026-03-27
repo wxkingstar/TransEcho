@@ -193,6 +193,12 @@ pub async fn start_interpretation(
         let mut chunk_size_interleaved: usize = 0;
         let mut audio_buffer: Vec<f32> = Vec::new();
 
+        // Silence detection: RMS threshold below which audio is considered silence.
+        // This prevents sending silent frames to the API during pauses, which would
+        // cause the ASR engine to repeat the last recognized sentence.
+        const SILENCE_RMS_THRESHOLD: f32 = 0.001;
+        let mut silence_frames: u64 = 0;
+
         while let Some(frame) = audio_rx.recv().await {
             // Initialize resampler on first frame using actual capture format
             if resampler.is_none() {
@@ -217,6 +223,28 @@ pub async fn start_interpretation(
                         return;
                     }
                 }
+            }
+
+            // Silence detection: skip frames that are effectively silent
+            let rms: f32 = if frame.samples.is_empty() {
+                0.0
+            } else {
+                (frame.samples.iter().map(|s| s * s).sum::<f32>() / frame.samples.len() as f32).sqrt()
+            };
+
+            if rms < SILENCE_RMS_THRESHOLD {
+                silence_frames += 1;
+                if silence_frames == 50 {
+                    debug!("Audio silence detected, suppressing empty frames");
+                }
+                continue;
+            }
+
+            if silence_frames > 0 {
+                if silence_frames >= 50 {
+                    debug!("Audio resumed after {} silent frames", silence_frames);
+                }
+                silence_frames = 0;
             }
 
             let resampler = resampler.as_mut().unwrap();
