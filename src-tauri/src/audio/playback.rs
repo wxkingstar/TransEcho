@@ -1,10 +1,19 @@
 use rodio::{OutputStream, Sink, Source};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
+
+/// Current time in milliseconds since epoch (for TTS echo suppression timestamps).
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
 
 /// A streaming audio source with jitter buffer for smooth TTS playback.
 ///
@@ -18,9 +27,9 @@ struct StreamingSource {
     pos: usize,
     sample_rate: u32,
     initialized: bool,
-    /// Shared flag: true while real (non-silence) audio is being played.
-    /// Used by the capture pipeline to suppress loopback echo on Windows.
-    is_playing: Arc<AtomicBool>,
+    /// Timestamp (ms since epoch) of the last real audio sample played.
+    /// The capture pipeline uses this with a cooldown to suppress loopback echo.
+    last_played_ms: Arc<AtomicI64>,
 }
 
 impl StreamingSource {
@@ -79,7 +88,7 @@ impl Iterator for StreamingSource {
 
         // Get next chunk from internal buffer
         if let Some(chunk) = self.buffer.pop_front() {
-            self.is_playing.store(true, Ordering::Relaxed);
+            self.last_played_ms.store(now_ms(), Ordering::Relaxed);
             self.current_chunk = chunk;
             self.pos = 1;
             return Some(self.current_chunk[0]);
@@ -88,25 +97,21 @@ impl Iterator for StreamingSource {
         // Buffer empty — try once more (NON-BLOCKING, never stall the audio thread)
         match self.rx.try_recv() {
             Ok(chunk) => {
-                self.is_playing.store(true, Ordering::Relaxed);
+                self.last_played_ms.store(now_ms(), Ordering::Relaxed);
                 self.drain_available();
                 self.current_chunk = chunk;
                 self.pos = 1;
                 Some(self.current_chunk[0])
             }
             Err(std_mpsc::TryRecvError::Empty) => {
-                // No data available — TTS is idle, clear the playing flag so
-                // the capture pipeline resumes normal audio forwarding.
-                self.is_playing.store(false, Ordering::Relaxed);
+                // No data available — timestamp naturally expires, capture pipeline
+                // resumes normal audio forwarding after cooldown period.
                 let silence_samples = (self.sample_rate as usize * 10) / 1000;
                 self.current_chunk = vec![0.0; silence_samples];
                 self.pos = 1;
                 Some(0.0)
             }
-            Err(std_mpsc::TryRecvError::Disconnected) => {
-                self.is_playing.store(false, Ordering::Relaxed);
-                None
-            }
+            Err(std_mpsc::TryRecvError::Disconnected) => None,
         }
     }
 }
@@ -130,9 +135,9 @@ impl Source for StreamingSource {
 #[derive(Clone)]
 pub struct TtsHandle {
     tx: std_mpsc::SyncSender<Vec<f32>>,
-    /// Shared flag indicating TTS is actively playing audio.
-    /// The capture pipeline checks this to suppress loopback echo on Windows.
-    is_playing: Arc<AtomicBool>,
+    /// Timestamp (ms since epoch) of the last real audio sample played.
+    /// The capture pipeline checks this with a cooldown to suppress loopback echo.
+    last_played_ms: Arc<AtomicI64>,
 }
 
 impl TtsHandle {
@@ -143,8 +148,8 @@ impl TtsHandle {
     /// ensuring the handle is truly ready to play audio.
     pub fn new() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let (tx, rx) = std_mpsc::sync_channel::<Vec<f32>>(50);
-        let is_playing = Arc::new(AtomicBool::new(false));
-        let is_playing_clone = is_playing.clone();
+        let last_played_ms = Arc::new(AtomicI64::new(0));
+        let last_played_ms_clone = last_played_ms.clone();
         // Oneshot channel to confirm audio device initialization
         let (ready_tx, ready_rx) = std_mpsc::sync_channel::<Result<(), String>>(1);
 
@@ -177,7 +182,7 @@ impl TtsHandle {
                 pos: 0,
                 sample_rate: 24000,
                 initialized: false,
-                is_playing: is_playing_clone,
+                last_played_ms: last_played_ms_clone,
             };
 
             sink.append(source);
@@ -188,16 +193,17 @@ impl TtsHandle {
 
         // Wait for audio thread to confirm device initialization (up to 3 seconds)
         match ready_rx.recv_timeout(Duration::from_secs(3)) {
-            Ok(Ok(())) => Ok(Self { tx, is_playing }),
+            Ok(Ok(())) => Ok(Self { tx, last_played_ms }),
             Ok(Err(e)) => Err(e.into()),
             Err(_) => Err("TTS 播放器初始化超时".into()),
         }
     }
 
-    /// Returns a shared flag that is true while TTS is actively playing audio.
-    /// Used by the capture pipeline for echo suppression on Windows.
-    pub fn is_playing_flag(&self) -> Arc<AtomicBool> {
-        self.is_playing.clone()
+    /// Returns a shared timestamp (ms since epoch) of the last real audio played.
+    /// The capture pipeline compares this against current time with a cooldown
+    /// to suppress loopback echo, covering device buffer latency (~10-50ms).
+    pub fn last_played_ms(&self) -> Arc<AtomicI64> {
+        self.last_played_ms.clone()
     }
 
     /// Feed raw PCM bytes (32-bit float LE, 24kHz mono) to the player.

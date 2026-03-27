@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager};
 use tokio::sync::{mpsc, Mutex};
@@ -185,19 +186,19 @@ pub async fn start_interpretation(
         None
     };
 
-    // Echo suppression: share TTS playing state with audio pipeline.
-    // When TTS is playing, WASAPI loopback would capture the TTS output and
-    // re-send it to the API, causing a feedback loop. The pipeline sends
-    // zero-filled frames while TTS is active to suppress this.
-    let tts_is_playing: Arc<AtomicBool> = tts_player
+    // Echo suppression: share TTS playback timestamp with audio pipeline.
+    // When TTS is playing (or just finished within cooldown), WASAPI loopback
+    // would capture the TTS output and re-send it to the API, causing a
+    // feedback loop. The pipeline sends zero-filled frames during this window.
+    let tts_last_played: Arc<AtomicI64> = tts_player
         .as_ref()
-        .map(|p| p.is_playing_flag())
-        .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+        .map(|p| p.last_played_ms())
+        .unwrap_or_else(|| Arc::new(AtomicI64::new(0)));
 
     // Spawn audio pipeline: capture → resample → send to API
     let audio_sender = audio_tx.clone();
     let pipeline_on_sub = on_subtitle.clone();
-    let echo_suppression = tts_is_playing.clone();
+    let echo_suppression = tts_last_played.clone();
     tokio::spawn(async move {
         // Defer resampler init until first frame so we can read actual sample_rate/channels
         let mut resampler: Option<AudioResampler> = None;
@@ -214,8 +215,16 @@ pub async fn start_interpretation(
         // prevents chattering when noise hovers near the threshold).
         const SILENCE_WAKE_THRESHOLD: f32 = 0.02;
         const SILENCE_SUSTAIN_FRAMES: u64 = 30;
+        // Keepalive: send a small burst of zero frames every ~5 seconds during
+        // sustained silence to prevent WebSocket timeout, without flooding the API.
+        const KEEPALIVE_INTERVAL_FRAMES: u64 = 250; // ~5s at 50fps
+        const KEEPALIVE_BURST_FRAMES: u64 = 5;      // ~100ms of zero data
+        // Echo suppression cooldown: covers WASAPI device buffer latency (~10-50ms)
+        // so residual TTS audio draining through speakers is also suppressed.
+        const ECHO_COOLDOWN_MS: i64 = 150;
         let mut silence_frames: u64 = 0;
         let mut in_silence = false;
+        let mut keepalive_counter: u64 = 0;
 
         while let Some(frame) = audio_rx.recv().await {
             // Initialize resampler on first frame using actual capture format
@@ -253,36 +262,47 @@ pub async fn start_interpretation(
             // Use hysteresis: once in sustained silence, require higher energy to resume
             let effective_threshold = if in_silence { SILENCE_WAKE_THRESHOLD } else { SILENCE_RMS_THRESHOLD };
 
-            let is_silent;
             if rms < effective_threshold {
                 silence_frames += 1;
                 if silence_frames == SILENCE_SUSTAIN_FRAMES {
                     in_silence = true;
-                    debug!("Audio silence detected (sustained), sending zero frames");
+                    debug!("Audio silence detected (sustained), suppressing frames");
                 }
-                is_silent = in_silence;
             } else {
                 if in_silence {
                     debug!("Audio resumed after {} silent frames (rms={:.4})", silence_frames, rms);
                 }
                 silence_frames = 0;
                 in_silence = false;
-                is_silent = false;
+            }
+
+            // Echo suppression: compare TTS last-played timestamp against current
+            // time with cooldown to cover device buffer latency (~10-50ms).
+            let last_tts = echo_suppression.load(Ordering::Relaxed);
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64;
+            let tts_active = last_tts > 0 && (now - last_tts) < ECHO_COOLDOWN_MS;
+
+            if !tts_active && in_silence {
+                // Natural sustained silence: mostly skip, but send a small burst
+                // of zero frames every ~5 seconds to keep WebSocket alive.
+                keepalive_counter += 1;
+                if keepalive_counter % KEEPALIVE_INTERVAL_FRAMES >= KEEPALIVE_BURST_FRAMES {
+                    continue;
+                }
+            } else if !tts_active {
+                keepalive_counter = 0;
             }
 
             let resampler = resampler.as_mut().unwrap();
 
-            // Echo suppression: when TTS is playing, WASAPI loopback captures
-            // the TTS output which would be re-sent to the API causing a
-            // feedback loop. Treat TTS playback as silence.
-            let tts_active = echo_suppression.load(Ordering::Relaxed);
-
-            // During sustained silence or TTS echo suppression, send zero-filled
-            // frames to keep the API stream alive while preventing feedback.
-            if is_silent || tts_active {
-                let zeros = vec![0.0f32; frame.samples.len()];
-                audio_buffer.extend_from_slice(&zeros);
+            if tts_active || in_silence {
+                // TTS echo suppression or silence keepalive: send zero frames
+                audio_buffer.extend(std::iter::repeat(0.0f32).take(frame.samples.len()));
             } else {
+                // Real audio: pass through normally
                 audio_buffer.extend_from_slice(&frame.samples);
             }
 
