@@ -84,12 +84,39 @@ Frontend (Svelte 5 / SvelteKit)     Backend (Rust / Tokio)
 
 - **Silence detection**: RMS threshold 0.01 (normal) / 0.02 (wake from silence, hysteresis). Sustained silence after 30 frames.
 - **Echo suppression**: `AtomicI64` timestamp shared between TTS playback thread and capture pipeline. 150ms cooldown covers WASAPI device buffer latency.
-- **Silence keepalive**: During sustained natural silence, sends a 5-frame zero burst every ~250 frames (~5s) to prevent WebSocket timeout. TTS echo suppression sends zeros continuously.
+- **Auto-pause**: After 60s sustained silence, auto-disconnects API to save tokens. Reconnects automatically when speech resumes (~1-2s delay). Short pauses (<60s) send zero frames for instant resume.
 - **Channel buffer sizes**: capture→pipeline: 50 frames, pipeline→API: 100 frames, TTS audio: 50 chunks.
+- **Unified task**: Audio pipeline and event loop are merged into a single tokio task using `tokio::select!`, enabling session lifecycle management (connect/disconnect/reconnect).
 
-## CI/CD
+## CI/CD & Release
 
 - GitHub Actions (`.github/workflows/build.yml`) triggers on `v*` tags
-- Builds both macOS (dmg) and Windows (msi + nsis exe) artifacts
-- macOS production builds are signed + notarized locally (Developer ID: INAGORA CO., LTD.)
-- Release workflow: bump version in `Cargo.toml` + `tauri.conf.json` + `package.json` → commit → tag `v{version}` → push tag → CI builds Windows → create GitHub Release with all artifacts
+- CI builds Windows (msi + nsis exe) artifacts only; macOS CI build fails (no signing certificate)
+- **macOS must be built locally** because it requires Developer ID signing + Apple notarization (Developer ID: INAGORA CO., LTD.), which needs local keychain access
+
+### Release workflow
+
+```bash
+# 1. Bump version in all 3 files
+#    - src-tauri/Cargo.toml, src-tauri/tauri.conf.json, package.json
+
+# 2. Commit, tag, push
+git commit -am "Bump version to v0.1.x"
+git push origin main
+git tag v0.1.x && git push origin v0.1.x   # triggers Windows CI
+
+# 3. Build macOS locally (requires signing identity in keychain)
+npm run tauri build
+
+# 4. Wait for Windows CI, download artifacts
+gh run download <run-id> -n windows-installer -D /tmp/win
+
+# 5. Create GitHub Release with all artifacts
+gh release create v0.1.x \
+  src-tauri/target/release/bundle/dmg/TransEcho_0.1.x_aarch64.dmg \
+  /tmp/win/msi/TransEcho_0.1.x_x64_en-US.msi \
+  /tmp/win/nsis/TransEcho_0.1.x_x64-setup.exe \
+  --title "v0.1.x" --notes "..."
+```
+
+Steps 3 and 4 can run in parallel (local macOS build + CI Windows build).
