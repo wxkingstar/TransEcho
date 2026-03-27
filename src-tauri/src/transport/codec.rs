@@ -35,7 +35,7 @@ pub fn encode_start_session(config: &SessionConfig) -> Vec<u8> {
         user: Some(User {
             uid: String::new(),
             did: String::new(),
-            platform: "macOS".to_string(),
+            platform: std::env::consts::OS.to_string(),
             sdk_version: String::new(),
             app_version: String::new(),
         }),
