@@ -27,11 +27,11 @@
 
 > 看日语直播听不懂？看英文会议跟不上？TransEcho 直接捕获 macOS 系统音频，实时翻译成你的语言，字幕 + 语音同传，零延迟体验。
 
-<!--
 ## 截图预览
 
-![TransEcho Screenshot](docs/screenshot.png)
--->
+<p align="center">
+  <img src="docs/screenshot.png" width="420" alt="TransEcho 实时同声传译截图">
+</p>
 
 ## 功能特性
 
