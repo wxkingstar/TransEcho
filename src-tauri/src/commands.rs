@@ -88,6 +88,14 @@ pub async fn start_interpretation(
     let mode = if enable_tts { "s2s" } else { "s2t" };
     info!("Starting interpretation: mode={}", mode);
 
+    // Save config params for potential reconnection during auto-pause
+    let cfg_app_key = app_key.clone();
+    let cfg_access_key = access_key.clone();
+    let cfg_source_lang = source_language.clone();
+    let cfg_target_lang = target_language.clone();
+    let cfg_speaker_id = speaker_id.clone();
+    let cfg_mode = mode.to_string();
+
     let session_id = uuid::Uuid::new_v4().to_string();
     let connection_id = uuid::Uuid::new_v4().to_string();
 
@@ -113,7 +121,7 @@ pub async fn start_interpretation(
     let client = TranslationClient::new(config);
     // map_err converts Box<dyn Error> (non-Send) to String before any await
     let connect_result = client.connect().await.map_err(|e| e.to_string());
-    let (audio_tx, mut event_rx) = match connect_result {
+    let (audio_tx, event_rx) = match connect_result {
         Ok(v) => v,
         Err(err_msg) => {
             *state.stop_tx.lock().await = None;
@@ -122,6 +130,7 @@ pub async fn start_interpretation(
     };
 
     // Wait for SessionStarted with timeout to prevent hanging forever
+    let mut event_rx = event_rx;
     match timeout(Duration::from_secs(10), event_rx.recv()).await {
         Err(_) => {
             *state.stop_tx.lock().await = None;
@@ -187,184 +196,54 @@ pub async fn start_interpretation(
     };
 
     // Echo suppression: share TTS playback timestamp with audio pipeline.
-    // When TTS is playing (or just finished within cooldown), WASAPI loopback
-    // would capture the TTS output and re-send it to the API, causing a
-    // feedback loop. The pipeline sends zero-filled frames during this window.
     let tts_last_played: Arc<AtomicI64> = tts_player
         .as_ref()
         .map(|p| p.last_played_ms())
         .unwrap_or_else(|| Arc::new(AtomicI64::new(0)));
-
-    // Spawn audio pipeline: capture → resample → send to API
-    let audio_sender = audio_tx.clone();
-    let pipeline_on_sub = on_subtitle.clone();
     let echo_suppression = tts_last_played.clone();
+
+    // Spawn unified session lifecycle task.
+    // Merges audio pipeline + event loop into one task to support
+    // auto-pause (disconnect API after 60s silence) and auto-reconnect
+    // (reconnect when speech resumes), saving API tokens during idle periods.
+    let on_sub = on_subtitle.clone();
+    let app_handle = app.clone();
     tokio::spawn(async move {
-        // Defer resampler init until first frame so we can read actual sample_rate/channels
+        let _cleanup = CleanupGuard {
+            app_handle: app_handle.clone(),
+        };
+
+        // API connection state (Option allows disconnect/reconnect)
+        let mut audio_tx: Option<mpsc::Sender<Vec<i16>>> = Some(audio_tx);
+        let mut event_rx: Option<mpsc::Receiver<TranslationEvent>> = Some(event_rx);
+        let mut api_connected = true;
+
+        // Audio processing state
         let mut resampler: Option<AudioResampler> = None;
         let mut channels: u16;
         let mut chunk_size_interleaved: usize = 0;
         let mut audio_buffer: Vec<f32> = Vec::new();
 
         // Silence detection with hysteresis to prevent repeated speech during pauses.
-        // macOS ScreenCaptureKit delivers near-zero silence, but Windows WASAPI
-        // loopback has a higher noise floor (~0.002-0.01), so the threshold must
-        // be high enough for both platforms.
         const SILENCE_RMS_THRESHOLD: f32 = 0.01;
-        // After sustained silence, require a higher RMS to "wake up" (hysteresis
-        // prevents chattering when noise hovers near the threshold).
         const SILENCE_WAKE_THRESHOLD: f32 = 0.02;
         const SILENCE_SUSTAIN_FRAMES: u64 = 30;
-        // Keepalive: send a small burst of zero frames every ~5 seconds during
-        // sustained silence to prevent WebSocket timeout, without flooding the API.
-        const KEEPALIVE_INTERVAL_FRAMES: u64 = 250; // ~5s at 50fps
-        const KEEPALIVE_BURST_FRAMES: u64 = 5;      // ~100ms of zero data
-        // Echo suppression cooldown: covers WASAPI device buffer latency (~10-50ms)
-        // so residual TTS audio draining through speakers is also suppressed.
+        // Auto-pause: disconnect API after 60s of sustained silence to save tokens.
+        // 60s × 50fps = 3000 frames. Reconnects automatically when speech resumes.
+        const AUTO_PAUSE_FRAMES: u64 = 3000;
         const ECHO_COOLDOWN_MS: i64 = 150;
         let mut silence_frames: u64 = 0;
         let mut in_silence = false;
-        let mut keepalive_counter: u64 = 0;
-
-        while let Some(frame) = audio_rx.recv().await {
-            // Initialize resampler on first frame using actual capture format
-            if resampler.is_none() {
-                channels = frame.channels;
-                match AudioResampler::new(frame.sample_rate, frame.channels) {
-                    Ok(r) => {
-                        chunk_size_interleaved = r.input_frames_next() * channels as usize;
-                        audio_buffer.reserve(chunk_size_interleaved * 2);
-                        info!(
-                            "Resampler initialized: {}Hz {}ch, chunk_size={}",
-                            frame.sample_rate, channels, chunk_size_interleaved
-                        );
-                        resampler = Some(r);
-                    }
-                    Err(e) => {
-                        error!("Resampler error: {}", e);
-                        pipeline_on_sub
-                            .send(SubtitleEvent::Error {
-                                message: format!("音频重采样初始化失败: {}", e),
-                            })
-                            .ok();
-                        return;
-                    }
-                }
-            }
-
-            // Silence detection: skip frames that are effectively silent
-            let rms: f32 = if frame.samples.is_empty() {
-                0.0
-            } else {
-                (frame.samples.iter().map(|s| s * s).sum::<f32>() / frame.samples.len() as f32).sqrt()
-            };
-
-            // Use hysteresis: once in sustained silence, require higher energy to resume
-            let effective_threshold = if in_silence { SILENCE_WAKE_THRESHOLD } else { SILENCE_RMS_THRESHOLD };
-
-            if rms < effective_threshold {
-                silence_frames += 1;
-                if silence_frames == SILENCE_SUSTAIN_FRAMES {
-                    in_silence = true;
-                    debug!("Audio silence detected (sustained), suppressing frames");
-                }
-            } else {
-                if in_silence {
-                    debug!("Audio resumed after {} silent frames (rms={:.4})", silence_frames, rms);
-                }
-                silence_frames = 0;
-                in_silence = false;
-            }
-
-            // Echo suppression: compare TTS last-played timestamp against current
-            // time with cooldown to cover device buffer latency (~10-50ms).
-            let last_tts = echo_suppression.load(Ordering::Relaxed);
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as i64;
-            let tts_active = last_tts > 0 && (now - last_tts) < ECHO_COOLDOWN_MS;
-
-            if !tts_active && in_silence {
-                // Natural sustained silence: mostly skip, but send a small burst
-                // of zero frames every ~5 seconds to keep WebSocket alive.
-                keepalive_counter += 1;
-                if keepalive_counter % KEEPALIVE_INTERVAL_FRAMES >= KEEPALIVE_BURST_FRAMES {
-                    continue;
-                }
-            } else if !tts_active {
-                keepalive_counter = 0;
-            }
-
-            let resampler = resampler.as_mut().unwrap();
-
-            if tts_active || in_silence {
-                // TTS echo suppression or silence keepalive: send zero frames
-                audio_buffer.extend(std::iter::repeat(0.0f32).take(frame.samples.len()));
-            } else {
-                // Real audio: pass through normally
-                audio_buffer.extend_from_slice(&frame.samples);
-            }
-
-            while audio_buffer.len() >= chunk_size_interleaved {
-                let chunk: Vec<f32> = audio_buffer.drain(..chunk_size_interleaved).collect();
-                match resampler.process(&chunk) {
-                    Ok(pcm16) => {
-                        let mut offset = 0;
-                        while offset < pcm16.len() {
-                            let end = (offset + 1280).min(pcm16.len());
-                            if audio_sender.send(pcm16[offset..end].to_vec()).await.is_err() {
-                                return;
-                            }
-                            offset = end;
-                        }
-                    }
-                    Err(e) => warn!("Resample: {}", e),
-                }
-            }
-        }
-
-        // Flush residual audio samples
-        if !audio_buffer.is_empty() {
-            if let Some(resampler) = resampler.as_mut() {
-                match resampler.process(&audio_buffer) {
-                    Ok(pcm16) => {
-                        if !pcm16.is_empty() {
-                            let _ = audio_sender.send(pcm16).await;
-                        }
-                    }
-                    Err(e) => debug!("Flush resample: {}", e),
-                }
-            }
-        }
-    });
-
-    // Spawn event loop: forward translation events to frontend + play TTS
-    let on_sub = on_subtitle.clone();
-    let app_handle = app.clone();
-    tokio::spawn(async move {
-        // Drop guard ensures stop_tx is cleared even if this task panics
-        let _cleanup = CleanupGuard {
-            app_handle: app_handle.clone(),
-        };
 
         // Text-based dedup: track recent finalized texts to filter repeats.
-        // Checks both exact match and concatenation match (API may combine
-        // multiple previous utterances into one accumulated result).
         let mut recent_sources: VecDeque<String> = VecDeque::with_capacity(16);
         let mut recent_translations: VecDeque<String> = VecDeque::with_capacity(16);
         const DEDUP_WINDOW: usize = 15;
 
-        // Returns true if `text` is a duplicate: either an exact match against
-        // a recent entry, or composed entirely of consecutive recent entries.
         let is_duplicate = |text: &str, recent: &VecDeque<String>| -> bool {
-            // Exact match
             if recent.iter().any(|r| r == text) {
                 return true;
             }
-            // Concatenation match: check if `text` equals the concatenation
-            // of 2+ consecutive recent entries (API sometimes re-sends
-            // accumulated text like "A。B。" from finalized "A。" + "B。").
             if recent.len() >= 2 {
                 for start in 0..recent.len() {
                     let mut concat = String::new();
@@ -383,85 +262,293 @@ pub async fn start_interpretation(
         };
 
         loop {
-            tokio::select! {
-                event = event_rx.recv() => {
-                    match event {
-                        Some(TranslationEvent::SourceSubtitle { text, is_final, .. }) => {
-                            if !text.is_empty() {
-                                if is_final {
-                                    if is_duplicate(&text, &recent_sources) {
-                                        debug!("Skipping duplicate source: {}", text);
-                                    } else {
-                                        recent_sources.push_back(text.clone());
-                                        if recent_sources.len() > DEDUP_WINDOW {
-                                            recent_sources.pop_front();
+            if api_connected {
+                // === Connected mode: process audio + handle API events ===
+                let mut need_auto_pause = false;
+                let mut need_break = false;
+                let mut send_failed = false;
+
+                {
+                    // Borrow event_rx for the select block; released after the block
+                    let erx = event_rx.as_mut().unwrap();
+
+                    tokio::select! {
+                        frame_opt = audio_rx.recv() => {
+                            if let Some(frame) = frame_opt {
+                                // Initialize resampler on first frame
+                                if resampler.is_none() {
+                                    channels = frame.channels;
+                                    match AudioResampler::new(frame.sample_rate, frame.channels) {
+                                        Ok(r) => {
+                                            chunk_size_interleaved = r.input_frames_next() * channels as usize;
+                                            audio_buffer.reserve(chunk_size_interleaved * 2);
+                                            info!(
+                                                "Resampler initialized: {}Hz {}ch, chunk_size={}",
+                                                frame.sample_rate, channels, chunk_size_interleaved
+                                            );
+                                            resampler = Some(r);
                                         }
-                                        on_sub.send(SubtitleEvent::Source { text, is_final }).ok();
-                                    }
-                                } else {
-                                    on_sub.send(SubtitleEvent::Source { text, is_final }).ok();
-                                }
-                            }
-                        }
-                        Some(TranslationEvent::TranslationSubtitle { text, is_final, .. }) => {
-                            if !text.is_empty() {
-                                if is_final {
-                                    if is_duplicate(&text, &recent_translations) {
-                                        debug!("Skipping duplicate translation: {}", text);
-                                    } else {
-                                        recent_translations.push_back(text.clone());
-                                        if recent_translations.len() > DEDUP_WINDOW {
-                                            recent_translations.pop_front();
+                                        Err(e) => {
+                                            error!("Resampler error: {}", e);
+                                            on_sub.send(SubtitleEvent::Error {
+                                                message: format!("音频重采样初始化失败: {}", e),
+                                            }).ok();
+                                            need_break = true;
                                         }
-                                        on_sub.send(SubtitleEvent::Translation { text, is_final }).ok();
                                     }
-                                } else {
-                                    on_sub.send(SubtitleEvent::Translation { text, is_final }).ok();
                                 }
-                            }
-                        }
-                        Some(TranslationEvent::TtsAudio { data }) => {
-                            if let Some(ref player) = tts_player {
-                                debug!("TTS audio chunk: {} bytes", data.len());
-                                player.play_pcm_bytes(&data);
+
+                                if !need_break {
+                                    // Silence detection
+                                    let rms: f32 = if frame.samples.is_empty() {
+                                        0.0
+                                    } else {
+                                        (frame.samples.iter().map(|s| s * s).sum::<f32>() / frame.samples.len() as f32).sqrt()
+                                    };
+
+                                    let effective_threshold = if in_silence { SILENCE_WAKE_THRESHOLD } else { SILENCE_RMS_THRESHOLD };
+
+                                    if rms < effective_threshold {
+                                        silence_frames += 1;
+                                        if silence_frames == SILENCE_SUSTAIN_FRAMES {
+                                            in_silence = true;
+                                            debug!("Audio silence detected (sustained), suppressing frames");
+                                        }
+                                    } else {
+                                        if in_silence {
+                                            debug!("Audio resumed after {} silent frames (rms={:.4})", silence_frames, rms);
+                                        }
+                                        silence_frames = 0;
+                                        in_silence = false;
+                                    }
+
+                                    // Auto-pause: disconnect API after 60s sustained silence
+                                    if in_silence && silence_frames >= AUTO_PAUSE_FRAMES {
+                                        need_auto_pause = true;
+                                    } else {
+                                        // Echo suppression
+                                        let last_tts = echo_suppression.load(Ordering::Relaxed);
+                                        let now = SystemTime::now()
+                                            .duration_since(UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_millis() as i64;
+                                        let tts_active = last_tts > 0 && (now - last_tts) < ECHO_COOLDOWN_MS;
+
+                                        let resampler = resampler.as_mut().unwrap();
+
+                                        if tts_active || in_silence {
+                                            audio_buffer.extend(std::iter::repeat(0.0f32).take(frame.samples.len()));
+                                        } else {
+                                            audio_buffer.extend_from_slice(&frame.samples);
+                                        }
+
+                                        // Resample and send to API
+                                        while audio_buffer.len() >= chunk_size_interleaved {
+                                            let chunk: Vec<f32> = audio_buffer.drain(..chunk_size_interleaved).collect();
+                                            match resampler.process(&chunk) {
+                                                Ok(pcm16) => {
+                                                    if let Some(ref tx) = audio_tx {
+                                                        let mut offset = 0;
+                                                        while offset < pcm16.len() {
+                                                            let end = (offset + 1280).min(pcm16.len());
+                                                            if tx.send(pcm16[offset..end].to_vec()).await.is_err() {
+                                                                send_failed = true;
+                                                                break;
+                                                            }
+                                                            offset = end;
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => warn!("Resample: {}", e),
+                                            }
+                                            if send_failed { break; }
+                                        }
+                                    }
+                                }
                             } else {
-                                debug!("TTS audio received but no player");
+                                // Audio capture ended
+                                need_break = true;
                             }
                         }
-                        Some(TranslationEvent::SessionFailed { message }) => {
-                            on_sub.send(SubtitleEvent::Error { message }).ok();
-                            break;
+                        event = erx.recv() => {
+                            match event {
+                                Some(TranslationEvent::SourceSubtitle { text, is_final, .. }) => {
+                                    if !text.is_empty() {
+                                        if is_final {
+                                            if is_duplicate(&text, &recent_sources) {
+                                                debug!("Skipping duplicate source: {}", text);
+                                            } else {
+                                                recent_sources.push_back(text.clone());
+                                                if recent_sources.len() > DEDUP_WINDOW {
+                                                    recent_sources.pop_front();
+                                                }
+                                                on_sub.send(SubtitleEvent::Source { text, is_final }).ok();
+                                            }
+                                        } else {
+                                            on_sub.send(SubtitleEvent::Source { text, is_final }).ok();
+                                        }
+                                    }
+                                }
+                                Some(TranslationEvent::TranslationSubtitle { text, is_final, .. }) => {
+                                    if !text.is_empty() {
+                                        if is_final {
+                                            if is_duplicate(&text, &recent_translations) {
+                                                debug!("Skipping duplicate translation: {}", text);
+                                            } else {
+                                                recent_translations.push_back(text.clone());
+                                                if recent_translations.len() > DEDUP_WINDOW {
+                                                    recent_translations.pop_front();
+                                                }
+                                                on_sub.send(SubtitleEvent::Translation { text, is_final }).ok();
+                                            }
+                                        } else {
+                                            on_sub.send(SubtitleEvent::Translation { text, is_final }).ok();
+                                        }
+                                    }
+                                }
+                                Some(TranslationEvent::TtsAudio { data }) => {
+                                    if let Some(ref player) = tts_player {
+                                        debug!("TTS audio chunk: {} bytes", data.len());
+                                        player.play_pcm_bytes(&data);
+                                    }
+                                }
+                                Some(TranslationEvent::SessionFailed { message }) => {
+                                    on_sub.send(SubtitleEvent::Error { message }).ok();
+                                    need_break = true;
+                                }
+                                Some(TranslationEvent::SessionFinished) => {
+                                    on_sub.send(SubtitleEvent::Status { message: "会话结束".to_string() }).ok();
+                                    need_break = true;
+                                }
+                                None => {
+                                    on_sub.send(SubtitleEvent::Error {
+                                        message: "连接已断开".to_string(),
+                                    }).ok();
+                                    need_break = true;
+                                }
+                                _ => {}
+                            }
                         }
-                        Some(TranslationEvent::SessionFinished) => {
-                            on_sub.send(SubtitleEvent::Status { message: "会话结束".to_string() }).ok();
-                            break;
+                        _ = stop_rx.recv() => {
+                            info!("Stop signal received");
+                            on_sub.send(SubtitleEvent::Status { message: "已停止".to_string() }).ok();
+                            need_break = true;
                         }
-                        None => {
-                            // All event senders dropped — connection lost
-                            on_sub.send(SubtitleEvent::Error {
-                                message: "连接已断开".to_string(),
-                            }).ok();
-                            break;
-                        }
-                        _ => {}
+                    }
+                } // event_rx borrow released here
+
+                if need_break {
+                    break;
+                }
+
+                if need_auto_pause || send_failed {
+                    // Disconnect API, enter saving mode
+                    audio_tx = None;
+                    event_rx = None;
+                    api_connected = false;
+                    audio_buffer.clear();
+                    if need_auto_pause {
+                        info!("Auto-pause: 60s sustained silence, disconnecting API to save tokens");
+                        on_sub.send(SubtitleEvent::Status {
+                            message: "长时间静音，已暂停以节省资源".to_string(),
+                        }).ok();
+                    } else {
+                        info!("API send failed, entering disconnected mode");
                     }
                 }
-                _ = stop_rx.recv() => {
-                    info!("Stop signal received");
-                    on_sub.send(SubtitleEvent::Status { message: "已停止".to_string() }).ok();
-                    break;
+            } else {
+                // === Disconnected mode: monitor audio, wait for speech to reconnect ===
+                tokio::select! {
+                    frame = audio_rx.recv() => {
+                        let Some(frame) = frame else { break; };
+
+                        let rms: f32 = if frame.samples.is_empty() {
+                            0.0
+                        } else {
+                            (frame.samples.iter().map(|s| s * s).sum::<f32>() / frame.samples.len() as f32).sqrt()
+                        };
+
+                        if rms >= SILENCE_WAKE_THRESHOLD {
+                            // Speech detected — reconnect API
+                            info!("Speech detected after auto-pause (rms={:.4}), reconnecting...", rms);
+                            on_sub.send(SubtitleEvent::Status {
+                                message: "检测到语音，正在重新连接...".to_string(),
+                            }).ok();
+
+                            let new_config = SessionConfig {
+                                app_key: cfg_app_key.clone(),
+                                access_key: cfg_access_key.clone(),
+                                resource_id: "volc.service_type.10053".to_string(),
+                                connection_id: uuid::Uuid::new_v4().to_string(),
+                                session_id: uuid::Uuid::new_v4().to_string(),
+                                mode: cfg_mode.clone(),
+                                source_language: cfg_source_lang.clone(),
+                                target_language: cfg_target_lang.clone(),
+                                speaker_id: cfg_speaker_id.clone(),
+                            };
+
+                            let new_client = TranslationClient::new(new_config);
+                            match new_client.connect().await.map_err(|e| e.to_string()) {
+                                Ok((new_tx, mut new_rx)) => {
+                                    match timeout(Duration::from_secs(10), new_rx.recv()).await {
+                                        Ok(Some(TranslationEvent::SessionStarted)) => {
+                                            audio_tx = Some(new_tx);
+                                            event_rx = Some(new_rx);
+                                            api_connected = true;
+                                            silence_frames = 0;
+                                            in_silence = false;
+                                            audio_buffer.clear();
+                                            info!("Auto-reconnect successful");
+                                            on_sub.send(SubtitleEvent::Status {
+                                                message: if enable_tts {
+                                                    "已重新连接 (语音+字幕)".to_string()
+                                                } else {
+                                                    "已重新连接 (字幕)".to_string()
+                                                },
+                                            }).ok();
+                                        }
+                                        Ok(Some(TranslationEvent::SessionFailed { message })) => {
+                                            warn!("Reconnect failed: {}", message);
+                                            on_sub.send(SubtitleEvent::Error {
+                                                message: format!("重新连接失败: {}", message),
+                                            }).ok();
+                                            break;
+                                        }
+                                        _ => {
+                                            warn!("Reconnect timeout");
+                                            on_sub.send(SubtitleEvent::Error {
+                                                message: "重新连接超时".to_string(),
+                                            }).ok();
+                                            break;
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("Reconnect error: {}", e);
+                                    on_sub.send(SubtitleEvent::Error {
+                                        message: format!("重新连接失败: {}", e),
+                                    }).ok();
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    _ = stop_rx.recv() => {
+                        info!("Stop signal received");
+                        on_sub.send(SubtitleEvent::Status { message: "已停止".to_string() }).ok();
+                        break;
+                    }
                 }
             }
         }
 
-        // Cleanup: restore system volume if changed
+        // Cleanup
         if let Some(vol) = original_volume {
             playback::set_system_volume(vol);
         }
         drop(tts_player);
         drop(audio_tx);
         capture_handle.stop().ok();
-        // Explicit cleanup (also done by CleanupGuard as safety net)
         *app_handle.state::<AppState>().stop_tx.lock().await = None;
     });
 
