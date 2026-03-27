@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager};
 use tokio::sync::{mpsc, Mutex};
@@ -183,9 +185,19 @@ pub async fn start_interpretation(
         None
     };
 
+    // Echo suppression: share TTS playing state with audio pipeline.
+    // When TTS is playing, WASAPI loopback would capture the TTS output and
+    // re-send it to the API, causing a feedback loop. The pipeline sends
+    // zero-filled frames while TTS is active to suppress this.
+    let tts_is_playing: Arc<AtomicBool> = tts_player
+        .as_ref()
+        .map(|p| p.is_playing_flag())
+        .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+
     // Spawn audio pipeline: capture → resample → send to API
     let audio_sender = audio_tx.clone();
     let pipeline_on_sub = on_subtitle.clone();
+    let echo_suppression = tts_is_playing.clone();
     tokio::spawn(async move {
         // Defer resampler init until first frame so we can read actual sample_rate/channels
         let mut resampler: Option<AudioResampler> = None;
@@ -260,10 +272,14 @@ pub async fn start_interpretation(
 
             let resampler = resampler.as_mut().unwrap();
 
-            // During sustained silence, send zero-filled frames to keep the API
-            // stream alive (prevents "audio sending too slow" error) while
-            // ensuring the API sees silence and doesn't hallucinate speech.
-            if is_silent {
+            // Echo suppression: when TTS is playing, WASAPI loopback captures
+            // the TTS output which would be re-sent to the API causing a
+            // feedback loop. Treat TTS playback as silence.
+            let tts_active = echo_suppression.load(Ordering::Relaxed);
+
+            // During sustained silence or TTS echo suppression, send zero-filled
+            // frames to keep the API stream alive while preventing feedback.
+            if is_silent || tts_active {
                 let zeros = vec![0.0f32; frame.samples.len()];
                 audio_buffer.extend_from_slice(&zeros);
             } else {
