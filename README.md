@@ -143,6 +143,12 @@ TransEcho/
 ## 常见问题
 
 <details>
+<summary><b>macOS 提示"无法验证开发者"？</b></summary>
+
+首次打开时系统可能提示无法验证开发者。前往：系统设置 → 隐私与安全 → 向下滚动找到 TransEcho → 点击「仍要打开」。
+</details>
+
+<details>
 <summary><b>没有声音输入？</b></summary>
 
 确保已授予「屏幕录制」权限：系统设置 → 隐私与安全 → 屏幕录制 → 勾选 TransEcho。授权后需重启应用。
