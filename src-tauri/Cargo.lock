@@ -4120,31 +4120,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
-name = "sts"
-version = "0.1.0"
-dependencies = [
- "dotenvy",
- "futures-util",
- "http",
- "prost",
- "prost-build",
- "rodio",
- "rubato",
- "screencapturekit",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "tauri-plugin-opener",
- "tauri-plugin-store",
- "tokio",
- "tokio-tungstenite",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
 name = "swift-rs"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4992,6 +4967,31 @@ dependencies = [
  "thread_local",
  "tracing-core",
  "tracing-log",
+]
+
+[[package]]
+name = "transecho"
+version = "0.1.1"
+dependencies = [
+ "dotenvy",
+ "futures-util",
+ "http",
+ "prost",
+ "prost-build",
+ "rodio",
+ "rubato",
+ "screencapturekit",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-opener",
+ "tauri-plugin-store",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

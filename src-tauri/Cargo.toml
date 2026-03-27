@@ -1,11 +1,11 @@
 [package]
-name = "sts"
-version = "0.1.0"
-description = "STS - 桌面端实时同声传译"
+name = "transecho"
+version = "0.1.1"
+description = "TransEcho - 桌面端实时同声传译"
 edition = "2021"
 
 [lib]
-name = "sts_lib"
+name = "transecho_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

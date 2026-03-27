@@ -345,7 +345,7 @@
           完成
         </button>
 
-        <p class="copyright">by wangxin</p>
+        <p class="copyright">by wangxin · <a href="https://github.com/wxkingstar/TransEcho" target="_blank">GitHub</a></p>
       </div>
     </div>
   {/if}
@@ -823,5 +823,15 @@
     font-size: 11px;
     color: var(--text-muted);
     opacity: 0.5;
+  }
+
+  .copyright a {
+    color: var(--text-muted);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+
+  .copyright a:hover {
+    color: var(--text);
   }
 </style>
