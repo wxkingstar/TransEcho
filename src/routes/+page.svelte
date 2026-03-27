@@ -1,8 +1,11 @@
 <script lang="ts">
   import { invoke, Channel } from "@tauri-apps/api/core";
   import { getVersion } from "@tauri-apps/api/app";
+  import { openUrl } from "@tauri-apps/plugin-opener";
+  import { detectLocale, t, translateStatus, type Locale } from "$lib/i18n";
 
   let appVersion = $state("");
+  const uiLang: Locale = detectLocale();
 
   function getSystemLang(): string {
     const lang = navigator.language.toLowerCase().split("-")[0];
@@ -109,14 +112,14 @@
           }
           break;
         case "status":
-          status = event.message || "";
+          status = event.message ? translateStatus(uiLang, event.message) : "";
           // Handle terminal states from backend
-          if (event.message === "已停止" || event.message === "会话结束") {
+          if (event.message === "stopped" || event.message === "session_ended") {
             isRunning = false;
           }
           break;
         case "error":
-          status = event.message || "未知错误";
+          status = event.message ? translateStatus(uiLang, event.message) : t(uiLang, "unknown_error");
           isRunning = false;
           break;
       }
@@ -135,7 +138,7 @@
         speakerId: enableTts ? speakerId : "",
       });
     } catch (e) {
-      status = `${e}`;
+      status = translateStatus(uiLang, `${e}`);
       isRunning = false;
     }
   }
@@ -199,9 +202,9 @@
   ];
 
   const voices = [
-    { id: "zh_female_vv_uranus_bigtts", name: "女声 A" },
-    { id: "zh_female_xiaoai_uranus_bigtts", name: "女声 B" },
-    { id: "zh_male_jingqiangkanye_emo_mars_bigtts", name: "男声" },
+    { id: "zh_female_vv_uranus_bigtts", key: "voiceFemaleA" },
+    { id: "zh_female_xiaoai_uranus_bigtts", key: "voiceFemaleB" },
+    { id: "zh_male_jingqiangkanye_emo_mars_bigtts", key: "voiceMale" },
   ];
 </script>
 
@@ -223,7 +226,7 @@
         {/each}
       </select>
     </div>
-    <button class="icon-btn" onclick={() => (showSettings = true)} title="设置">
+    <button class="icon-btn" onclick={() => (showSettings = true)} title={t(uiLang, "settings")}>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
         <path d="M12 15a3 3 0 100-6 3 3 0 000 6z" />
         <path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 01-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 008.7 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 8.7a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06a1.65 1.65 0 001.82.33H9a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06a1.65 1.65 0 00-.33 1.82V9c.26.604.852.997 1.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z" />
@@ -242,7 +245,7 @@
             <path d="M24 32v4M20 36h8" />
           </svg>
         </div>
-        <p>点击下方按钮开始同声传译</p>
+        <p>{t(uiLang, "emptyHint")}</p>
       </div>
     {/if}
     {#each subtitles as pair}
@@ -274,12 +277,12 @@
           <svg viewBox="0 0 24 24" fill="currentColor">
             <rect x="7" y="7" width="10" height="10" rx="2" />
           </svg>
-          <span>停止</span>
+          <span>{t(uiLang, "stop")}</span>
         </div>
       {:else}
         <div class="btn-inner">
           <div class="mic-dot"></div>
-          <span>开始同传</span>
+          <span>{t(uiLang, "start")}</span>
         </div>
       {/if}
     </button>
@@ -290,7 +293,7 @@
     <div class="overlay" onclick={closeSettings}>
       <div class="settings-panel" onclick={(e) => e.stopPropagation()}>
         <div class="settings-header">
-          <h2>设置</h2>
+          <h2>{t(uiLang, "settings")}</h2>
           <button class="icon-btn close-btn" onclick={closeSettings} disabled={!appKey || !accessKey}>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <path d="M18 6L6 18M6 6l12 12" />
@@ -300,8 +303,8 @@
 
         <div class="settings-body">
           <div class="api-info">
-            <p class="api-desc">需要填入<a href="https://console.volcengine.com/speech/service/10030" target="_blank">豆包同声传译 2.0 大模型</a>的凭证</p>
-            <p class="api-note">新用户可免费获得 100 万 token</p>
+            <p class="api-desc">{t(uiLang, "apiDescBefore")}<a href="https://console.volcengine.com/speech/service/10030" onclick={(e) => { e.preventDefault(); openUrl("https://console.volcengine.com/speech/service/10030"); }}>{t(uiLang, "apiDescLink")}</a>{t(uiLang, "apiDescAfter")}</p>
+            <p class="api-note">{t(uiLang, "apiNote")}</p>
           </div>
 
           <div class="field">
@@ -310,7 +313,7 @@
               id="app-key"
               type="text"
               bind:value={appKey}
-              placeholder="豆包同传 APP ID"
+              placeholder={t(uiLang, "appIdPlaceholder")}
             />
           </div>
           <div class="field">
@@ -319,7 +322,7 @@
               id="access-key"
               type="password"
               bind:value={accessKey}
-              placeholder="豆包同传 Access Token"
+              placeholder={t(uiLang, "accessTokenPlaceholder")}
             />
           </div>
 
@@ -327,7 +330,7 @@
 
           <div class="field">
             <div class="tts-header">
-              <label>语音同传</label>
+              <label>{t(uiLang, "voiceTts")}</label>
               <label class="toggle">
                 <input type="checkbox" bind:checked={enableTts} />
                 <span class="toggle-track"><span class="toggle-thumb"></span></span>
@@ -340,7 +343,7 @@
                     class="voice-chip"
                     class:active={speakerId === v.id}
                     onclick={() => (speakerId = v.id)}
-                  >{v.name}</button>
+                  >{t(uiLang, v.key)}</button>
                 {/each}
               </div>
             {/if}
@@ -348,10 +351,10 @@
         </div>
 
         <button class="save-btn" onclick={closeSettings} disabled={!appKey || !accessKey}>
-          完成
+          {t(uiLang, "done")}
         </button>
 
-        <p class="copyright">{#if appVersion}v{appVersion} · {/if}by wangxin · <a href="https://github.com/wxkingstar/TransEcho" target="_blank">GitHub</a></p>
+        <p class="copyright">{#if appVersion}v{appVersion} · {/if}by wangxin · <a href="https://github.com/wxkingstar/TransEcho" onclick={(e) => { e.preventDefault(); openUrl("https://github.com/wxkingstar/TransEcho"); }}>GitHub</a></p>
       </div>
     </div>
   {/if}

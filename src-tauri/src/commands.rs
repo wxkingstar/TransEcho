@@ -114,7 +114,7 @@ pub async fn start_interpretation(
     // Connect to API
     on_subtitle
         .send(SubtitleEvent::Status {
-            message: "正在连接 API...".to_string(),
+            message: "connecting".to_string(),
         })
         .ok();
 
@@ -134,27 +134,27 @@ pub async fn start_interpretation(
     match timeout(Duration::from_secs(10), event_rx.recv()).await {
         Err(_) => {
             *state.stop_tx.lock().await = None;
-            return Err("API 连接超时 (10秒未响应)".to_string());
+            return Err("timeout".to_string());
         }
         Ok(response) => match response {
             Some(TranslationEvent::SessionStarted) => {
                 on_subtitle
                     .send(SubtitleEvent::Status {
                         message: if enable_tts {
-                            "API 已连接 (语音+字幕)".to_string()
+                            "connected_tts".to_string()
                         } else {
-                            "API 已连接 (字幕)".to_string()
+                            "connected_text".to_string()
                         },
                     })
                     .ok();
             }
             Some(TranslationEvent::SessionFailed { message }) => {
                 *state.stop_tx.lock().await = None;
-                return Err(format!("API 连接失败: {}", message));
+                return Err(format!("api_failed:{}", message));
             }
             _ => {
                 *state.stop_tx.lock().await = None;
-                return Err("意外的 API 响应".to_string());
+                return Err("unexpected_response".to_string());
             }
         },
     }
@@ -171,7 +171,7 @@ pub async fn start_interpretation(
 
     on_subtitle
         .send(SubtitleEvent::Status {
-            message: "开始同传".to_string(),
+            message: "started".to_string(),
         })
         .ok();
 
@@ -185,7 +185,7 @@ pub async fn start_interpretation(
                 warn!("TTS player init failed: {}, continuing without voice", e);
                 on_subtitle
                     .send(SubtitleEvent::Status {
-                        message: "语音播放初始化失败，仅显示字幕".to_string(),
+                        message: "tts_init_failed".to_string(),
                     })
                     .ok();
                 None
@@ -291,7 +291,7 @@ pub async fn start_interpretation(
                                         Err(e) => {
                                             error!("Resampler error: {}", e);
                                             on_sub.send(SubtitleEvent::Error {
-                                                message: format!("音频重采样初始化失败: {}", e),
+                                                message: format!("resample_failed:{}", e),
                                             }).ok();
                                             need_break = true;
                                         }
@@ -417,12 +417,12 @@ pub async fn start_interpretation(
                                     need_break = true;
                                 }
                                 Some(TranslationEvent::SessionFinished) => {
-                                    on_sub.send(SubtitleEvent::Status { message: "会话结束".to_string() }).ok();
+                                    on_sub.send(SubtitleEvent::Status { message: "session_ended".to_string() }).ok();
                                     need_break = true;
                                 }
                                 None => {
                                     on_sub.send(SubtitleEvent::Error {
-                                        message: "连接已断开".to_string(),
+                                        message: "disconnected".to_string(),
                                     }).ok();
                                     need_break = true;
                                 }
@@ -431,7 +431,7 @@ pub async fn start_interpretation(
                         }
                         _ = stop_rx.recv() => {
                             info!("Stop signal received");
-                            on_sub.send(SubtitleEvent::Status { message: "已停止".to_string() }).ok();
+                            on_sub.send(SubtitleEvent::Status { message: "stopped".to_string() }).ok();
                             need_break = true;
                         }
                     }
@@ -450,7 +450,7 @@ pub async fn start_interpretation(
                     if need_auto_pause {
                         info!("Auto-pause: 60s sustained silence, disconnecting API to save tokens");
                         on_sub.send(SubtitleEvent::Status {
-                            message: "长时间静音，已暂停以节省资源".to_string(),
+                            message: "auto_paused".to_string(),
                         }).ok();
                     } else {
                         info!("API send failed, entering disconnected mode");
@@ -472,7 +472,7 @@ pub async fn start_interpretation(
                             // Speech detected — reconnect API
                             info!("Speech detected after auto-pause (rms={:.4}), reconnecting...", rms);
                             on_sub.send(SubtitleEvent::Status {
-                                message: "检测到语音，正在重新连接...".to_string(),
+                                message: "reconnecting".to_string(),
                             }).ok();
 
                             let new_config = SessionConfig {
@@ -501,23 +501,23 @@ pub async fn start_interpretation(
                                             info!("Auto-reconnect successful");
                                             on_sub.send(SubtitleEvent::Status {
                                                 message: if enable_tts {
-                                                    "已重新连接 (语音+字幕)".to_string()
+                                                    "reconnected_tts".to_string()
                                                 } else {
-                                                    "已重新连接 (字幕)".to_string()
+                                                    "reconnected_text".to_string()
                                                 },
                                             }).ok();
                                         }
                                         Ok(Some(TranslationEvent::SessionFailed { message })) => {
                                             warn!("Reconnect failed: {}", message);
                                             on_sub.send(SubtitleEvent::Error {
-                                                message: format!("重新连接失败: {}", message),
+                                                message: format!("reconnect_failed:{}", message),
                                             }).ok();
                                             break;
                                         }
                                         _ => {
                                             warn!("Reconnect timeout");
                                             on_sub.send(SubtitleEvent::Error {
-                                                message: "重新连接超时".to_string(),
+                                                message: "reconnect_timeout".to_string(),
                                             }).ok();
                                             break;
                                         }
@@ -526,7 +526,7 @@ pub async fn start_interpretation(
                                 Err(e) => {
                                     warn!("Reconnect error: {}", e);
                                     on_sub.send(SubtitleEvent::Error {
-                                        message: format!("重新连接失败: {}", e),
+                                        message: format!("reconnect_failed:{}", e),
                                     }).ok();
                                     break;
                                 }
@@ -535,7 +535,7 @@ pub async fn start_interpretation(
                     }
                     _ = stop_rx.recv() => {
                         info!("Stop signal received");
-                        on_sub.send(SubtitleEvent::Status { message: "已停止".to_string() }).ok();
+                        on_sub.send(SubtitleEvent::Status { message: "stopped".to_string() }).ok();
                         break;
                     }
                 }
