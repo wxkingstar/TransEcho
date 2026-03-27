@@ -241,25 +241,34 @@ pub async fn start_interpretation(
             // Use hysteresis: once in sustained silence, require higher energy to resume
             let effective_threshold = if in_silence { SILENCE_WAKE_THRESHOLD } else { SILENCE_RMS_THRESHOLD };
 
+            let is_silent;
             if rms < effective_threshold {
                 silence_frames += 1;
                 if silence_frames == SILENCE_SUSTAIN_FRAMES {
                     in_silence = true;
-                    debug!("Audio silence detected (sustained), suppressing frames");
+                    debug!("Audio silence detected (sustained), sending zero frames");
                 }
-                continue;
-            }
-
-            if silence_frames > 0 {
+                is_silent = in_silence;
+            } else {
                 if in_silence {
                     debug!("Audio resumed after {} silent frames (rms={:.4})", silence_frames, rms);
                 }
                 silence_frames = 0;
                 in_silence = false;
+                is_silent = false;
             }
 
             let resampler = resampler.as_mut().unwrap();
-            audio_buffer.extend_from_slice(&frame.samples);
+
+            // During sustained silence, send zero-filled frames to keep the API
+            // stream alive (prevents "audio sending too slow" error) while
+            // ensuring the API sees silence and doesn't hallucinate speech.
+            if is_silent {
+                let zeros = vec![0.0f32; frame.samples.len()];
+                audio_buffer.extend_from_slice(&zeros);
+            } else {
+                audio_buffer.extend_from_slice(&frame.samples);
+            }
 
             while audio_buffer.len() >= chunk_size_interleaved {
                 let chunk: Vec<f32> = audio_buffer.drain(..chunk_size_interleaved).collect();
@@ -303,10 +312,39 @@ pub async fn start_interpretation(
             app_handle: app_handle.clone(),
         };
 
-        // Text-based dedup: track recent finalized texts to filter repeats
+        // Text-based dedup: track recent finalized texts to filter repeats.
+        // Checks both exact match and concatenation match (API may combine
+        // multiple previous utterances into one accumulated result).
         let mut recent_sources: VecDeque<String> = VecDeque::with_capacity(16);
         let mut recent_translations: VecDeque<String> = VecDeque::with_capacity(16);
         const DEDUP_WINDOW: usize = 15;
+
+        // Returns true if `text` is a duplicate: either an exact match against
+        // a recent entry, or composed entirely of consecutive recent entries.
+        let is_duplicate = |text: &str, recent: &VecDeque<String>| -> bool {
+            // Exact match
+            if recent.iter().any(|r| r == text) {
+                return true;
+            }
+            // Concatenation match: check if `text` equals the concatenation
+            // of 2+ consecutive recent entries (API sometimes re-sends
+            // accumulated text like "A。B。" from finalized "A。" + "B。").
+            if recent.len() >= 2 {
+                for start in 0..recent.len() {
+                    let mut concat = String::new();
+                    for i in start..recent.len() {
+                        concat.push_str(&recent[i]);
+                        if concat.len() > text.len() {
+                            break;
+                        }
+                        if concat == text && i > start {
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
+        };
 
         loop {
             tokio::select! {
@@ -315,7 +353,7 @@ pub async fn start_interpretation(
                         Some(TranslationEvent::SourceSubtitle { text, is_final, .. }) => {
                             if !text.is_empty() {
                                 if is_final {
-                                    if recent_sources.contains(&text) {
+                                    if is_duplicate(&text, &recent_sources) {
                                         debug!("Skipping duplicate source: {}", text);
                                     } else {
                                         recent_sources.push_back(text.clone());
@@ -332,7 +370,7 @@ pub async fn start_interpretation(
                         Some(TranslationEvent::TranslationSubtitle { text, is_final, .. }) => {
                             if !text.is_empty() {
                                 if is_final {
-                                    if recent_translations.contains(&text) {
+                                    if is_duplicate(&text, &recent_translations) {
                                         debug!("Skipping duplicate translation: {}", text);
                                     } else {
                                         recent_translations.push_back(text.clone());
