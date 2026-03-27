@@ -193,11 +193,17 @@ pub async fn start_interpretation(
         let mut chunk_size_interleaved: usize = 0;
         let mut audio_buffer: Vec<f32> = Vec::new();
 
-        // Silence detection: RMS threshold below which audio is considered silence.
-        // This prevents sending silent frames to the API during pauses, which would
-        // cause the ASR engine to repeat the last recognized sentence.
-        const SILENCE_RMS_THRESHOLD: f32 = 0.001;
+        // Silence detection with hysteresis to prevent repeated speech during pauses.
+        // macOS ScreenCaptureKit delivers near-zero silence, but Windows WASAPI
+        // loopback has a higher noise floor (~0.002-0.01), so the threshold must
+        // be high enough for both platforms.
+        const SILENCE_RMS_THRESHOLD: f32 = 0.01;
+        // After sustained silence, require a higher RMS to "wake up" (hysteresis
+        // prevents chattering when noise hovers near the threshold).
+        const SILENCE_WAKE_THRESHOLD: f32 = 0.02;
+        const SILENCE_SUSTAIN_FRAMES: u64 = 30;
         let mut silence_frames: u64 = 0;
+        let mut in_silence = false;
 
         while let Some(frame) = audio_rx.recv().await {
             // Initialize resampler on first frame using actual capture format
@@ -232,19 +238,24 @@ pub async fn start_interpretation(
                 (frame.samples.iter().map(|s| s * s).sum::<f32>() / frame.samples.len() as f32).sqrt()
             };
 
-            if rms < SILENCE_RMS_THRESHOLD {
+            // Use hysteresis: once in sustained silence, require higher energy to resume
+            let effective_threshold = if in_silence { SILENCE_WAKE_THRESHOLD } else { SILENCE_RMS_THRESHOLD };
+
+            if rms < effective_threshold {
                 silence_frames += 1;
-                if silence_frames == 50 {
-                    debug!("Audio silence detected, suppressing empty frames");
+                if silence_frames == SILENCE_SUSTAIN_FRAMES {
+                    in_silence = true;
+                    debug!("Audio silence detected (sustained), suppressing frames");
                 }
                 continue;
             }
 
             if silence_frames > 0 {
-                if silence_frames >= 50 {
-                    debug!("Audio resumed after {} silent frames", silence_frames);
+                if in_silence {
+                    debug!("Audio resumed after {} silent frames (rms={:.4})", silence_frames, rms);
                 }
                 silence_frames = 0;
+                in_silence = false;
             }
 
             let resampler = resampler.as_mut().unwrap();

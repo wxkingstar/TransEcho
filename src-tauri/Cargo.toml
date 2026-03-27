@@ -1,6 +1,6 @@
 [package]
 name = "transecho"
-version = "0.1.3"
+version = "0.1.4"
 description = "TransEcho - 桌面端实时同声传译"
 edition = "2021"
 

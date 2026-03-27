@@ -1,5 +1,8 @@
 <script lang="ts">
   import { invoke, Channel } from "@tauri-apps/api/core";
+  import { getVersion } from "@tauri-apps/api/app";
+
+  let appVersion = $state("");
 
   function getSystemLang(): string {
     const lang = navigator.language.toLowerCase().split("-")[0];
@@ -23,6 +26,9 @@
   let wasAtBottom = $state(true);
 
   async function loadSettings() {
+    try {
+      appVersion = await getVersion();
+    } catch (_) {}
     try {
       const { load } = await import("@tauri-apps/plugin-store");
       const store = await load("settings.json");
@@ -345,7 +351,7 @@
           完成
         </button>
 
-        <p class="copyright">by wangxin · <a href="https://github.com/wxkingstar/TransEcho" target="_blank">GitHub</a></p>
+        <p class="copyright">{#if appVersion}v{appVersion} · {/if}by wangxin · <a href="https://github.com/wxkingstar/TransEcho" target="_blank">GitHub</a></p>
       </div>
     </div>
   {/if}
